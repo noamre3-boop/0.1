@@ -1,18 +1,76 @@
-name: Build APK
+name: Build Android APK
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Download repository
+        uses: actions/checkout@v4
 
-      - name: Upload App
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Extract app
+        run: |
+          mkdir -p www
+          unzip -o DataAnalyzerApp.zip -d www
+          test -f www/index.html
+          rm -f www/RUN.bat
+
+      - name: Repair original demo script
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p = Path("www/index.html")
+          html = p.read_text(encoding="utf-8")
+          html = re.sub(
+              r"<script>(.*?)</script>",
+              lambda m: "<script>" + m.group(1).replace("\n", "\\n") + "</script>",
+              html,
+              flags=re.S,
+          )
+          p.write_text(html, encoding="utf-8")
+          PY
+
+      - name: Create Android project
+        run: |
+          npm init -y
+          npm install @capacitor/core@7 @capacitor/android@7
+          npm install --save-dev @capacitor/cli@7
+          npx cap init "Data Analyzer" "com.noam.dataanalyzer" --web-dir www
+          npx cap add android
+          npx cap sync android
+
+      - name: Build debug APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: app-files
-          path: .
-          
+          name: DataAnalyzer-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
