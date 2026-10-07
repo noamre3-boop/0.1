@@ -2,75 +2,267 @@ name: Build Android APK
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: Build APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    env:
+      CI: "true"
+      CAPACITOR_TELEMETRY_DISABLED: "1"
 
     steps:
       - name: Download repository
         uses: actions/checkout@v4
 
-      - name: Set up Node
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: "22"
 
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: "21"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Extract app
+      - name: Prepare app files
+        shell: bash
         run: |
-          mkdir -p www
-          unzip -o DataAnalyzerApp.zip -d www
-          test -f www/index.html
-          rm -f www/RUN.bat
+          set -euo pipefail
+          mkdir -p apk-project/www
 
-      - name: Repair original demo script
-        run: |
           python3 - <<'PY'
           from pathlib import Path
+          import zipfile
+          import shutil
           import re
-          p = Path("www/index.html")
-          html = p.read_text(encoding="utf-8")
-          html = re.sub(
-              r"<script>(.*?)</script>",
-              lambda m: "<script>" + m.group(1).replace("\n", "\\n") + "</script>",
-              html,
-              flags=re.S,
-          )
-          p.write_text(html, encoding="utf-8")
+
+          root = Path.cwd()
+          target = root / "apk-project" / "www"
+          archive = root / "DataAnalyzerApp.zip"
+
+          if archive.exists():
+              unpacked = root / "apk-project" / "extracted"
+              unpacked.mkdir(parents=True, exist_ok=True)
+
+              with zipfile.ZipFile(archive) as z:
+                  for item in z.infolist():
+                      destination = (unpacked / item.filename).resolve()
+                      if not destination.is_relative_to(unpacked.resolve()):
+                          raise RuntimeError("Unsafe path in ZIP")
+                  z.extractall(unpacked)
+
+              candidates = sorted(
+                  unpacked.rglob("index.html"),
+                  key=lambda p: len(p.parts)
+              )
+              if not candidates:
+                  raise RuntimeError("ZIP does not contain index.html")
+
+              source = candidates[0].parent
+          elif (root / "index.html").exists():
+              source = root
+          else:
+              raise RuntimeError(
+                  "Upload DataAnalyzerApp.zip or index.html first"
+              )
+
+          excluded = {
+              ".git", ".github", "node_modules",
+              "android", "apk-project"
+          }
+
+          for item in source.iterdir():
+              if item.name in excluded:
+                  continue
+              if item.suffix.lower() in {".zip", ".bat", ".cmd"}:
+                  continue
+              destination = target / item.name
+              if item.is_dir():
+                  shutil.copytree(
+                      item, destination, dirs_exist_ok=True
+                  )
+              else:
+                  shutil.copy2(item, destination)
+
+          page = target / "index.html"
+          html = page.read_text(encoding="utf-8-sig")
+
+          # Repair the script in the original demo only.
+          if "1000" in html and "file.text()" in html:
+              script = r"""
+          <script>
+          const input = document.getElementById('f');
+          const output = document.getElementById('o');
+
+          input.addEventListener('change', async (event) => {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            try {
+              const text = await file.text();
+              output.textContent =
+                'File: ' + file.name + '\n' +
+                'Size: ' + file.size + ' bytes\n\n' +
+                'Preview:\n' + text.slice(0, 1000);
+            } catch (error) {
+              output.textContent = 'Error: ' + error.message;
+            }
+          });
+          </script>
+          """
+              html = re.sub(
+                  r"<script\b[^>]*>.*?</script>",
+                  lambda match: script,
+                  html,
+                  count=1,
+                  flags=re.S | re.I,
+              )
+
+          # Capacitor needs a proper head element.
+          if not re.search(r"<head\b", html, flags=re.I):
+              html = re.sub(
+                  r"(<html\b[^>]*>)",
+                  r"\1<head>",
+                  html,
+                  count=1,
+                  flags=re.I,
+              )
+              html = re.sub(
+                  r"(<body\b)",
+                  r"</head>\1",
+                  html,
+                  count=1,
+                  flags=re.I,
+              )
+
+          if "name=\"viewport\"" not in html:
+              html = re.sub(
+                  r"</head>",
+                  '<meta name="viewport" '
+                  'content="width=device-width, initial-scale=1">'
+                  '</head>',
+                  html,
+                  count=1,
+                  flags=re.I,
+              )
+
+          page.write_text(html, encoding="utf-8")
+          print("App files prepared:", page)
           PY
 
-      - name: Create Android project
+      - name: Create Capacitor Android project
+        working-directory: apk-project
+        shell: bash
         run: |
+          set -euo pipefail
+
           npm init -y
-          npm install @capacitor/core@7 @capacitor/android@7
-          npm install --save-dev @capacitor/cli@7
-          npx cap init "Data Analyzer" "com.noam.dataanalyzer" --web-dir www
+
+          npm install --save-exact \
+            @capacitor/core@7.0.1 \
+            @capacitor/android@7.0.1
+
+          npm install --save-dev --save-exact \
+            @capacitor/cli@7.0.1
+
+          cat > capacitor.config.json <<'JSON'
+          {
+            "appId": "com.noam.dataanalyzer",
+            "appName": "Data Analyzer",
+            "webDir": "www"
+          }
+          JSON
+
           npx cap add android
           npx cap sync android
 
-      - name: Build debug APK
-        working-directory: android
+      - name: Prepare existing Android SDK
+        shell: bash
         run: |
+          set -euo pipefail
+
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+
+          if [ ! -d "$SDK" ]; then
+            echo "::error::Android SDK directory not found: $SDK"
+            exit 1
+          fi
+
+          MANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+
+          if [ ! -x "$MANAGER" ]; then
+            MANAGER="$(find "$SDK/cmdline-tools" \
+              -type f -name sdkmanager | sort | tail -n 1)"
+          fi
+
+          if [ -z "$MANAGER" ] || [ ! -f "$MANAGER" ]; then
+            echo "::error::sdkmanager not found"
+            exit 1
+          fi
+
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          printf 'sdk.dir=%s\n' "$SDK" \
+            > apk-project/android/local.properties
+
+          # Avoid the yes | sdkmanager pipe failure.
+          python3 - "$MANAGER" "$SDK" <<'PY'
+          import subprocess
+          import sys
+
+          manager, sdk = sys.argv[1:]
+          result = subprocess.run(
+              [manager, "--sdk_root=" + sdk, "--licenses"],
+              input="y\n" * 200,
+              text=True,
+          )
+          if result.returncode != 0:
+              raise SystemExit(result.returncode)
+          PY
+
+          "$MANAGER" --sdk_root="$SDK" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Build APK
+        working-directory: apk-project/android
+        shell: bash
+        run: |
+          set -euo pipefail
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
+          ./gradlew assembleDebug \
+            --no-daemon \
+            --stacktrace \
+            --console=plain
+
+      - name: Prepare download
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          cp apk-project/android/app/build/outputs/apk/debug/app-debug.apk \
+            output/DataAnalyzer.apk
+          test -s output/DataAnalyzer.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: DataAnalyzer-APK
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          path: output/DataAnalyzer.apk
           if-no-files-found: error
+          retention-days: 14
